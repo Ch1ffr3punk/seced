@@ -71,16 +71,14 @@ func main() {
 	// Create buttons
 	saveButton := widget.NewButton("Save", editor.saveText)
 	loadButton := widget.NewButton("Load", editor.loadText)
-	newButton := widget.NewButton("New", editor.newFile)
 	clearButton := widget.NewButton("Clear", editor.clearEditor)
 	paddingButton := widget.NewButton("Padding", editor.showPadding)
 
-	// Create layout
+	// Create layout with two buttons on each side
 	buttons := container.NewHBox(
-		newButton,
+		paddingButton,
 		clearButton,
 		layout.NewSpacer(),
-		paddingButton,
 		saveButton,
 		loadButton,
 	)
@@ -209,12 +207,16 @@ func (e *SecureEditor) cleanup() {
 	e.fileLoaded = false
 }
 
-// clearEditor deletes sensitive data
+// clearEditor deletes sensitive data and clears clipboard
 func (e *SecureEditor) clearEditor() {
 	e.cleanup()
 	e.currentFile = ""
-	e.window.SetTitle("seced - Input field cleared")
-	dialog.ShowInformation("Cleared", "All sensitive data has been removed from memory.", e.window)
+	
+	// Clear clipboard
+	e.window.Clipboard().SetContent("")
+	
+	e.window.SetTitle("seced - Input field and clipboard cleared")
+	dialog.ShowInformation("Cleared", "All sensitive data has been removed from memory and clipboard.", e.window)
 }
 
 // formatBase64 formats Base64 strings with line breaks after 76 characters
