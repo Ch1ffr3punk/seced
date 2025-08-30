@@ -7,10 +7,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -18,7 +16,6 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/awnumar/memguard"
@@ -34,11 +31,8 @@ type SecureEditor struct {
 	passphrase  *memguard.LockedBuffer
 	secureText  *memguard.LockedBuffer
 	fileLoaded  bool
-	blockSize   int // Padding block size in bytes
+	isDarkTheme bool // Track current theme state
 }
-
-// Padding marker to identify padded content
-const paddingMarker = "PADDED||"
 
 func main() {
 	// Initialize MemGuard and ensure secure cleanup
@@ -47,14 +41,16 @@ func main() {
 
 	// Create Fyne app
 	myApp := app.NewWithID("oc2mx.net.seced")
-	myApp.Settings().SetTheme(theme.DarkTheme())
 	editor := &SecureEditor{
-		app:       myApp,
-		blockSize: 4096, // Default 4KB block size
+		app:         myApp,
+		isDarkTheme: true, // Start with dark theme
 	}
 
 	editor.window = myApp.NewWindow("seced")
 	editor.window.Resize(fyne.NewSize(700, 500))
+
+	// Set initial theme
+	myApp.Settings().SetTheme(theme.DarkTheme())
 
 	// Create text area
 	editor.textArea = widget.NewMultiLineEntry()
@@ -69,29 +65,43 @@ func main() {
 	editor.textArea.OnChanged = editor.onTextChanged
 
 	// Create buttons
-	saveButton := widget.NewButton("Save", editor.saveText)
-	loadButton := widget.NewButton("Load", editor.loadText)
+	saveButton := widget.NewButton("Save", editor.saveFile)
+	loadButton := widget.NewButton("Load", editor.loadFile)
 	clearButton := widget.NewButton("Clear", editor.clearEditor)
-	paddingButton := widget.NewButton("Padding", editor.showPadding)
+	encryptButton := widget.NewButton("Encrypt", editor.encryptText)
+	decryptButton := widget.NewButton("Decrypt", editor.decryptText)
 
-	// Create layout with two buttons on each side
-	buttons := container.NewHBox(
-		paddingButton,
-		clearButton,
+	// Create theme switch button
+	themeSwitch := widget.NewButton("☀️", editor.toggleTheme)
+	themeSwitch.Importance = widget.LowImportance
+
+	// Create top bar with theme switch on the right
+	topBar := container.NewHBox(
 		layout.NewSpacer(),
-		saveButton,
-		loadButton,
+		themeSwitch,
 	)
 
-	content := container.NewBorder(
-		nil,
+	// Create layout with buttons centered
+	buttons := container.NewHBox(
+		layout.NewSpacer(),
+		encryptButton,
+		decryptButton,
+		saveButton,
+		loadButton,
+		clearButton,
+		layout.NewSpacer(),
+	)
+
+	// Main content with top bar
+	mainContent := container.NewBorder(
+		topBar,
 		buttons,
 		nil,
 		nil,
 		editor.textArea,
 	)
 
-	editor.window.SetContent(content)
+	editor.window.SetContent(mainContent)
 	editor.window.SetCloseIntercept(func() {
 		editor.cleanup()
 		editor.window.Close()
@@ -99,87 +109,58 @@ func main() {
 	editor.window.ShowAndRun()
 }
 
-// showPadding shows the settings dialog
-func (e *SecureEditor) showPadding() {
-	blockSizeEntry := widget.NewEntry()
-	blockSizeEntry.SetText(fmt.Sprintf("%d", e.blockSize))
-	blockSizeEntry.SetPlaceHolder("Enter block size in bytes (e.g., 4096)")
-
-	formItems := []*widget.FormItem{
-		widget.NewFormItem("Block Size:", blockSizeEntry),
+// copyToClipboardWithCRLF copies text to clipboard with CRLF line endings
+func (e *SecureEditor) copyToClipboardWithCRLF() {
+	text := e.textArea.Text
+	if text != "" {
+		// Convert LF to CRLF for Windows compatibility
+		text = strings.ReplaceAll(text, "\n", "\r\n")
+		e.window.Clipboard().SetContent(text)
 	}
-
-	dialog.ShowForm(
-		"Settings (bytes)",
-		"Save",
-		"Cancel",
-		formItems,
-		func(confirmed bool) {
-			if !confirmed {
-				return
-			}
-
-			newSize, err := strconv.Atoi(blockSizeEntry.Text)
-			if err != nil || newSize < 128 {
-				dialog.ShowError(errors.New("Invalid block size. Must be at least 128 bytes."), e.window)
-				return
-			}
-
-			e.blockSize = newSize
-			dialog.ShowInformation("Settings Saved", fmt.Sprintf("Block size set to %d bytes", e.blockSize), e.window)
-		},
-		e.window,
-	)
 }
 
-// generateRandomUppercase generates random uppercase letters
-func generateRandomUppercase(length int) []byte {
-	randomBytes := make([]byte, length)
-	if _, err := rand.Read(randomBytes); err != nil {
-		return make([]byte, length) // Fallback: return empty bytes
+// toggleTheme switches between dark and light theme
+func (e *SecureEditor) toggleTheme() {
+	if e.isDarkTheme {
+		e.app.Settings().SetTheme(theme.LightTheme())
+		e.isDarkTheme = false
+	} else {
+		e.app.Settings().SetTheme(theme.DarkTheme())
+		e.isDarkTheme = true
 	}
-
-	// Convert to uppercase letters (A-Z)
-	for i := range randomBytes {
-		randomBytes[i] = byte('A' + int(randomBytes[i])%26)
-	}
-	return randomBytes
+	// Refresh the window to apply the new theme
+	e.window.Content().Refresh()
 }
 
-// padMessage pads the message to the specified block size with random uppercase letters
-func (e *SecureEditor) padMessage(message []byte) []byte {
-	requiredPadding := e.blockSize - len(message)
-	
-	if requiredPadding <= len(paddingMarker) {
-		// If we can't even fit the marker, don't pad
-		return message
+// pkcs7Pad adds PKCS#7 padding to the data
+func pkcs7Pad(data []byte, blockSize int) []byte {
+	padding := blockSize - (len(data) % blockSize)
+	if padding == 0 {
+		padding = blockSize
 	}
-
-	// Create padded message: original + marker + random padding
-	padded := make([]byte, e.blockSize)
-	copy(padded, message)
-	copy(padded[len(message):], paddingMarker)
-	
-	// Fill remaining space with random uppercase letters
-	randomPadding := generateRandomUppercase(requiredPadding - len(paddingMarker))
-	copy(padded[len(message)+len(paddingMarker):], randomPadding)
-	
+	padded := make([]byte, len(data)+padding)
+	copy(padded, data)
+	for i := len(data); i < len(padded); i++ {
+		padded[i] = byte(padding)
+	}
 	return padded
 }
 
-// removePadding removes padding if detected
-func removePadding(data []byte) []byte {
-	// Convert to string for easier searching
-	content := string(data)
-	
-	// Look for the padding marker
-	markerIndex := strings.Index(content, paddingMarker)
-	if markerIndex == -1 {
-		return data // No padding found, return original data
+// pkcs7Unpad removes PKCS#7 padding from the data
+func pkcs7Unpad(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, errors.New("empty data")
 	}
-	
-	// Return only the content before the marker
-	return data[:markerIndex]
+	padding := int(data[len(data)-1])
+	if padding > len(data) || padding == 0 {
+		return nil, errors.New("invalid padding")
+	}
+	for i := len(data) - padding; i < len(data); i++ {
+		if data[i] != byte(padding) {
+			return nil, errors.New("invalid padding")
+		}
+	}
+	return data[:len(data)-padding], nil
 }
 
 // onTextChanged is called on every text change
@@ -188,9 +169,12 @@ func (e *SecureEditor) onTextChanged(newText string) {
 	if e.secureText != nil {
 		e.secureText.Destroy()
 	}
-	
+
 	// Store new text in protected memory
 	e.secureText = memguard.NewBufferFromBytes([]byte(newText))
+	
+	// Automatically copy to clipboard with CRLF
+	e.copyToClipboardWithCRLF()
 }
 
 // cleanup ensures secure termination
@@ -211,10 +195,10 @@ func (e *SecureEditor) cleanup() {
 func (e *SecureEditor) clearEditor() {
 	e.cleanup()
 	e.currentFile = ""
-	
+
 	// Clear clipboard
 	e.window.Clipboard().SetContent("")
-	
+
 	e.window.SetTitle("seced - Input field and clipboard cleared")
 	dialog.ShowInformation("Cleared", "All sensitive data has been removed from memory and clipboard.", e.window)
 }
@@ -240,22 +224,17 @@ func decodeFormattedBase64(data string) ([]byte, error) {
 		}
 		return r
 	}, data)
-	
+
 	return base64.StdEncoding.DecodeString(cleanData)
 }
 
-// askPassword shows a dialog for password entry with block size option
-func (e *SecureEditor) askPassword(isSave bool, callback func(*memguard.LockedBuffer, error)) {
+// askPassword shows a dialog for password entry
+func (e *SecureEditor) askPassword(callback func(*memguard.LockedBuffer, error)) {
 	password := widget.NewPasswordEntry()
 	password.SetMinRowsVisible(1)
 
-	// Add block size option only for save operations
-	var formItems []*widget.FormItem
-	formItems = append(formItems, widget.NewFormItem("Password:", password))
-
-	if isSave {
-		blockSizeInfo := widget.NewLabel(fmt.Sprintf("Current block size: %d bytes", e.blockSize))
-		formItems = append(formItems, widget.NewFormItem("", blockSizeInfo))
+	formItems := []*widget.FormItem{
+		widget.NewFormItem("Password:", password),
 	}
 
 	dlg := dialog.NewForm(
@@ -269,8 +248,8 @@ func (e *SecureEditor) askPassword(isSave bool, callback func(*memguard.LockedBu
 				return
 			}
 
-			if len(password.Text) < 8 {
-				callback(nil, errors.New("Password must be at least 8 characters long"))
+			if len(password.Text) < 12 {
+				callback(nil, errors.New("Password must be at least 12 characters long"))
 				return
 			}
 
@@ -284,24 +263,167 @@ func (e *SecureEditor) askPassword(isSave bool, callback func(*memguard.LockedBu
 	dlg.Show()
 }
 
-// newFile clears the editor and resets the filename
-func (e *SecureEditor) newFile() {
-	e.cleanup()
-	e.window.SetTitle("seced - New file")
+// encryptText encrypts the text and displays it in the text area
+func (e *SecureEditor) encryptText() {
+	text := e.textArea.Text
+	if text == "" {
+		dialog.ShowInformation("Info", "No text to encrypt.", e.window)
+		return
+	}
+
+	// Ask for password
+	e.askPassword(func(passphrase *memguard.LockedBuffer, err error) {
+		if err != nil {
+			dialog.ShowError(err, e.window)
+			return
+		}
+
+		defer passphrase.Destroy()
+
+		// Perform encryption
+		encryptedData, err := e.performEncryption([]byte(text), passphrase)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("Encryption failed: %v", err), e.window)
+			return
+		}
+
+		// Display encrypted text in text area
+		e.textArea.SetText(encryptedData)
+		// dialog.ShowInformation("Success", "Text encrypted successfully.", e.window)
+	})
+}
+
+// performEncryption performs the actual encryption
+func (e *SecureEditor) performEncryption(textBytes []byte, passphrase *memguard.LockedBuffer) (string, error) {
+	// Pad the message using PKCS#7
+	paddedText := pkcs7Pad(textBytes, aes.BlockSize)
+
+	textBuffer := memguard.NewBufferFromBytes(paddedText)
+	defer textBuffer.Destroy()
+
+	// Generate salt and nonce
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", fmt.Errorf("error generating salt: %v", err)
+	}
+
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("error generating nonce: %v", err)
+	}
+
+	// Derive key with Argon2id
+	key := argon2.IDKey(passphrase.Bytes(), salt, 3, 64*1024, 4, 32)
+
+	// Prepare AES-GCM encryption
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("error creating cipher: %v", err)
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("error creating GCM: %v", err)
+	}
+
+	// Encrypt text
+	ciphertext := aesgcm.Seal(nil, nonce, textBuffer.Bytes(), nil)
+
+	// Prepare encrypted data
+	encryptedData := make([]byte, 0, 16+12+len(ciphertext))
+	encryptedData = append(encryptedData, salt...)
+	encryptedData = append(encryptedData, nonce...)
+	encryptedData = append(encryptedData, ciphertext...)
+
+	// Return base64-encoded data
+	base64Data := base64.StdEncoding.EncodeToString(encryptedData)
+	return formatBase64(base64Data), nil
+}
+
+// decryptText decrypts text from the text area
+func (e *SecureEditor) decryptText() {
+	text := e.textArea.Text
+	if text == "" {
+		dialog.ShowInformation("Info", "No text to decrypt.", e.window)
+		return
+	}
+
+	// Ask for password
+	e.askPassword(func(passphrase *memguard.LockedBuffer, err error) {
+		if err != nil {
+			dialog.ShowError(err, e.window)
+			return
+		}
+
+		defer passphrase.Destroy()
+
+		// Perform decryption
+		decryptedText, err := e.performDecryption(text, passphrase)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("Decryption failed: %v", err), e.window)
+			return
+		}
+
+		// Display decrypted text
+		e.textArea.SetText(decryptedText)
+		// dialog.ShowInformation("Success", "Text decrypted successfully.", e.window)
+	})
+}
+
+// performDecryption performs the actual decryption
+func (e *SecureEditor) performDecryption(encryptedData string, passphrase *memguard.LockedBuffer) (string, error) {
+	// Decode base64 data
+	encryptedBytes, err := decodeFormattedBase64(encryptedData)
+	if err != nil {
+		return "", fmt.Errorf("error decoding data: %v", err)
+	}
+
+	if len(encryptedBytes) < 28 {
+		return "", fmt.Errorf("encrypted data too short or corrupted")
+	}
+
+	salt := encryptedBytes[:16]
+	nonce := encryptedBytes[16:28]
+	ciphertext := encryptedBytes[28:]
+
+	// Derive key with Argon2id
+	key := argon2.IDKey(passphrase.Bytes(), salt, 3, 64*1024, 4, 32)
+
+	// Prepare AES-GCM decryption
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("error creating cipher: %v", err)
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("error creating GCM: %v", err)
+	}
+
+	// Decrypt text
+	plaintext, err := aesgcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", fmt.Errorf("decryption failed: wrong password?")
+	}
+
+	// Remove PKCS#7 padding
+	cleanText, err := pkcs7Unpad(plaintext)
+	if err != nil {
+		return "", fmt.Errorf("error removing padding: %v", err)
+	}
+
+	return string(cleanText), nil
 }
 
 // hasTextToSave checks if there is text to save
 func (e *SecureEditor) hasTextToSave() bool {
-	if e.secureText != nil && len(e.secureText.Bytes()) > 0 {
-		return true
-	}
 	return e.textArea.Text != ""
 }
 
 // showSaveDialog shows the save dialog
 func (e *SecureEditor) showSaveDialog() {
 	// Suggest default filename
-	filename := "encrypted.bin"
+	filename := "document.txt"
 	if e.currentFile != "" {
 		filename = filepath.Base(e.currentFile)
 	}
@@ -313,29 +435,16 @@ func (e *SecureEditor) showSaveDialog() {
 			dialog.ShowError(err, e.window)
 			return
 		}
-		
+
 		if uri == nil {
 			return // User cancelled
 		}
 		defer uri.Close()
 
 		e.currentFile = uri.URI().Path()
-		
-		// Ask for password with block size info
-		e.askPassword(true, func(passphrase *memguard.LockedBuffer, err error) {
-			if err != nil {
-				dialog.ShowError(err, e.window)
-				return
-			}
-			
-			if e.passphrase != nil {
-				e.passphrase.Destroy()
-			}
-			e.passphrase = passphrase
-			e.performSave()
-		})
+		e.saveFileContent()
 	}, e.window)
-	
+
 	saveDialog.SetFileName(filename)
 	saveDialog.Show()
 }
@@ -345,16 +454,16 @@ func isHarmlessError(err error) bool {
 	if err == nil {
 		return false
 	}
-	
+
 	errorMsg := err.Error()
 	return strings.Contains(errorMsg, "VIDEOS folder") ||
-	       strings.Contains(errorMsg, "MUSIC folder") ||
-	       strings.Contains(errorMsg, "PICTURES folder") ||
-	       strings.Contains(errorMsg, "DOCUMENTS folder")
+		strings.Contains(errorMsg, "MUSIC folder") ||
+		strings.Contains(errorMsg, "PICTURES folder") ||
+		strings.Contains(errorMsg, "DOCUMENTS folder")
 }
 
-// saveText saves the text encrypted to a file
-func (e *SecureEditor) saveText() {
+// saveFile saves the text as plain text to a file
+func (e *SecureEditor) saveFile() {
 	if !e.hasTextToSave() {
 		dialog.ShowInformation("Info", "No text to save.", e.window)
 		return
@@ -363,108 +472,30 @@ func (e *SecureEditor) saveText() {
 	e.showSaveDialog()
 }
 
-// performSave performs the actual encryption and saving
-func (e *SecureEditor) performSave() {
-	var text string
-	if e.secureText != nil {
-		text = string(e.secureText.Bytes())
-	} else {
-		text = e.textArea.Text
-	}
-	
+// saveFileContent performs the actual file saving
+func (e *SecureEditor) saveFileContent() {
+	text := e.textArea.Text
 	if text == "" {
 		dialog.ShowInformation("Info", "No text to save.", e.window)
 		return
 	}
 
-	textBytes := []byte(text)
-	
-	// Calculate required padding
-	requiredBlocks := int(math.Ceil(float64(len(textBytes)+len(paddingMarker)) / float64(e.blockSize)))
-	targetSize := requiredBlocks * e.blockSize
-	
-	// Temporarily adjust block size for this operation if needed
-	originalBlockSize := e.blockSize
-	if targetSize > e.blockSize {
-		e.blockSize = targetSize
-	}
-	
-	// Pad the message
-	paddedText := e.padMessage(textBytes)
-	
-	var textBuffer *memguard.LockedBuffer
-	if e.secureText != nil {
-		// Create new buffer with padded data
-		textBuffer = memguard.NewBufferFromBytes(paddedText)
-		defer textBuffer.Destroy()
-	} else {
-		textBuffer = memguard.NewBufferFromBytes(paddedText)
-		defer textBuffer.Destroy()
-	}
+	// Convert LF to CRLF for Windows compatibility
+	text = strings.ReplaceAll(text, "\n", "\r\n")
 
-	// Generate salt and nonce
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		dialog.ShowError(fmt.Errorf("Error generating salt: %v", err), e.window)
-		e.blockSize = originalBlockSize // Restore original block size
-		return
-	}
-
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		dialog.ShowError(fmt.Errorf("Error generating nonce: %v", err), e.window)
-		e.blockSize = originalBlockSize // Restore original block size
-		return
-	}
-
-	// Derive key with Argon2id
-	key := argon2.IDKey(e.passphrase.Bytes(), salt, 3, 64*1024, 4, 32)
-
-	// Prepare AES-GCM encryption
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		dialog.ShowError(fmt.Errorf("Error creating cipher: %v", err), e.window)
-		e.blockSize = originalBlockSize // Restore original block size
-		return
-	}
-
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
-		dialog.ShowError(fmt.Errorf("Error creating GCM: %v", err), e.window)
-		e.blockSize = originalBlockSize // Restore original block size
-		return
-	}
-
-	// Encrypt text
-	ciphertext := aesgcm.Seal(nil, nonce, textBuffer.Bytes(), nil)
-
-	// Save encrypted data in binary format
-	encryptedData := make([]byte, 0, 16+12+len(ciphertext))
-	encryptedData = append(encryptedData, salt...)
-	encryptedData = append(encryptedData, nonce...)
-	encryptedData = append(encryptedData, ciphertext...)
-
-	// Save base64-encoded data to file
-	base64Data := base64.StdEncoding.EncodeToString(encryptedData)
-	formattedBase64 := formatBase64(base64Data)
-	
-	err = os.WriteFile(e.currentFile, []byte(formattedBase64), 0600)
+	err := os.WriteFile(e.currentFile, []byte(text), 0600)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("Error saving file: %v", err), e.window)
-		e.blockSize = originalBlockSize // Restore original block size
 		return
 	}
-
-	// Restore original block size if it was temporarily adjusted
-	e.blockSize = originalBlockSize
 
 	e.window.SetTitle("seced - " + filepath.Base(e.currentFile))
 	e.fileLoaded = true
-	dialog.ShowInformation("Success", "Text has been securely saved.", e.window)
+	// dialog.ShowInformation("Success", "Data has been saved.", e.window)
 }
 
-// loadText loads an encrypted file and decrypts it
-func (e *SecureEditor) loadText() {
+// loadFile loads a plain text file
+func (e *SecureEditor) loadFile() {
 	loadDialog := dialog.NewFileOpen(func(uri fyne.URIReadCloser, err error) {
 		if err != nil && isHarmlessError(err) {
 			// Simply ignore and continue
@@ -472,95 +503,35 @@ func (e *SecureEditor) loadText() {
 			dialog.ShowError(err, e.window)
 			return
 		}
-		
+
 		if uri == nil {
 			return // User cancelled
 		}
 		defer uri.Close()
 
 		e.currentFile = uri.URI().Path()
-		
-		// Ask for password for decryption
-		e.askPassword(false, func(passphrase *memguard.LockedBuffer, err error) {
-			if err != nil {
-				dialog.ShowError(err, e.window)
-				return
-			}
-
-			if e.passphrase != nil {
-				e.passphrase.Destroy()
-			}
-			e.passphrase = passphrase
-			e.performLoad()
-		})
+		e.loadFileContent()
 	}, e.window)
-	
-	fileFilter := storage.NewExtensionFileFilter([]string{".bin", ".enc"})
-	loadDialog.SetFilter(fileFilter)
+
 	loadDialog.Show()
 }
 
-// performLoad performs the loading and decryption
-func (e *SecureEditor) performLoad() {
-	// Read base64-encoded data from file
-	base64Data, err := os.ReadFile(e.currentFile)
+// loadFileContent performs the actual file loading
+func (e *SecureEditor) loadFileContent() {
+	// Read data from file
+	content, err := os.ReadFile(e.currentFile)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("Error reading file: %v", err), e.window)
 		return
 	}
 
-	// Decode base64 data
-	encryptedData, err := decodeFormattedBase64(string(base64Data))
-	if err != nil {
-		dialog.ShowError(fmt.Errorf("Error decoding data: %v", err), e.window)
-		return
-	}
-
-	if len(encryptedData) < 28 {
-		dialog.ShowError(fmt.Errorf("File too short or corrupted"), e.window)
-		return
-	}
-
-	salt := encryptedData[:16]
-	nonce := encryptedData[16:28]
-	ciphertext := encryptedData[28:]
-
-	// Derive key with Argon2id
-	key := argon2.IDKey(e.passphrase.Bytes(), salt, 3, 64*1024, 4, 32)
-
-	// Prepare AES-GCM decryption
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		dialog.ShowError(fmt.Errorf("Error creating cipher: %v", err), e.window)
-		return
-	}
-
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
-		dialog.ShowError(fmt.Errorf("Error creating GCM: %v", err), e.window)
-		return
-	}
-
-	// Decrypt text
-	plaintext, err := aesgcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		dialog.ShowError(fmt.Errorf("Decryption failed: Wrong password?"), e.window)
-		return
-	}
-
-	// Remove padding if present
-	cleanText := removePadding(plaintext)
-
-	// Process decrypted text in a secured environment
-	if e.secureText != nil {
-		e.secureText.Destroy()
-	}
-	e.secureText = memguard.NewBufferFromBytes(cleanText)
+	// Convert CRLF to LF for consistent internal handling
+	text := strings.ReplaceAll(string(content), "\r\n", "\n")
 
 	// Display text in editor
-	e.textArea.SetText(string(e.secureText.Bytes()))
+	e.textArea.SetText(text)
 
 	e.window.SetTitle("seced - " + filepath.Base(e.currentFile))
 	e.fileLoaded = true
-	dialog.ShowInformation("Success", "Text has been successfully loaded.", e.window)
+	// dialog.ShowInformation("Success", "Data has been successfully loaded.", e.window)
 }
